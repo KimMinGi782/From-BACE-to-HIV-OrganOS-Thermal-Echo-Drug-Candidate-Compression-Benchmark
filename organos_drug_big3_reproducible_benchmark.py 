@@ -1,0 +1,266 @@
+# ============================================================
+# OrganOS Drug Benchmark Big Three
+# BACE • BBBP • HIV
+#
+# Reproducible Molecular Candidate Compression Benchmark
+#
+# Meaning:
+# Total molecules  -> OrganOS active candidates
+#
+# BACE :  1,513  -> 9
+# BBBP :  2,050  -> 9
+# HIV  : 41,120  -> 17
+# ============================================================
+
+import time
+import hashlib
+import urllib.request
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+SEED = 42
+np.random.seed(SEED)
+
+FP_BITS = 2048
+NGRAMS = [2, 3, 4]
+QUERY_COUNT = 100
+
+DEPTH = 12
+
+DATASETS = {
+    "BACE": {
+        "urls": [
+            "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/bace.csv",
+            "https://raw.githubusercontent.com/deepchem/deepchem/master/datasets/bace.csv",
+        ],
+        "branch": 1024,
+        "echo": 8,
+    },
+    "BBBP": {
+        "urls": [
+            "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/BBBP.csv",
+            "https://raw.githubusercontent.com/deepchem/deepchem/master/datasets/BBBP.csv",
+        ],
+        "branch": 1024,
+        "echo": 8,
+    },
+    "HIV": {
+        "urls": [
+            "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/HIV.csv",
+            "https://raw.githubusercontent.com/deepchem/deepchem/master/datasets/HIV.csv",
+        ],
+        "branch": 4096,
+        "echo": 16,
+    },
+}
+
+OUT_CSV = "organos_drug_big3_results.csv"
+
+
+def load_csv_robust(name, urls):
+    for url in urls:
+        try:
+            print(f"[LOAD] {name}: {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return pd.read_csv(r)
+        except Exception as e:
+            print(f"[FAIL] {name}: {type(e).__name__}: {e}")
+    return None
+
+
+def detect_columns(df):
+    smiles_col = None
+    label_col = None
+
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ["smiles", "mol", "drug"]:
+            smiles_col = c
+        if lc in ["class", "label", "y", "p_np", "hiv_active"]:
+            label_col = c
+
+    return smiles_col, label_col
+
+
+def stable_hash(text):
+    return int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
+
+
+def smiles_hash_fp(smiles):
+    vec = np.zeros(FP_BITS, dtype=np.float32)
+    s = str(smiles)
+
+    for n in NGRAMS:
+        if len(s) < n:
+            continue
+
+        for i in range(len(s) - n + 1):
+            token = s[i:i + n]
+            vec[stable_hash(token) % FP_BITS] = 1.0
+
+    return vec
+
+
+def tanimoto_scores(q, m):
+    inter = m @ q
+    union = m.sum(axis=1) + q.sum() - inter
+    return inter / np.maximum(union, 1e-9)
+
+
+def hit_at_k(labels, ranked, k):
+    ranked = ranked[:k]
+    return float(labels[ranked].sum() > 0)
+
+
+def ndcg_at_k(labels, ranked, k):
+    ranked = ranked[:k]
+    gains = labels[ranked]
+
+    dcg = np.sum(gains / np.log2(np.arange(2, len(gains) + 2)))
+
+    ideal = np.sort(labels)[::-1][:k]
+    idcg = np.sum(ideal / np.log2(np.arange(2, len(ideal) + 2)))
+
+    return float(dcg / idcg) if idcg > 0 else 0.0
+
+
+def thermal_echo(scores, branch, echo, depth=DEPTH):
+    pool = np.arange(len(scores))
+    stages = [len(pool)]
+
+    for _ in range(depth):
+        if len(pool) <= branch:
+            break
+
+        order = pool[np.argsort(scores[pool])[::-1]]
+        chunks = np.array_split(order, branch)
+
+        survivors = []
+        for ch in chunks:
+            if len(ch) == 0:
+                continue
+            survivors.append(ch[np.argmax(scores[ch])])
+
+        pool = np.array(survivors, dtype=np.int32)
+        stages.append(len(pool))
+
+    order = pool[np.argsort(scores[pool])[::-1]]
+
+    main = order[:1]
+    echo_nodes = order[1:1 + echo]
+
+    active = np.unique(np.concatenate([main, echo_nodes]))
+    ranked = active[np.argsort(scores[active])[::-1]]
+
+    stages.append(len(active))
+
+    return ranked, len(active), stages
+
+
+rows = []
+
+print("=" * 100)
+print("OrganOS Drug Benchmark Big Three")
+print("BACE • BBBP • HIV")
+print("=" * 100)
+
+for name, cfg in DATASETS.items():
+
+    print("\n" + "=" * 80)
+    print(name)
+    print("=" * 80)
+
+    df = load_csv_robust(name, cfg["urls"])
+
+    if df is None:
+        print("[SKIP] dataset load failed")
+        continue
+
+    smiles_col, label_col = detect_columns(df)
+
+    if smiles_col is None or label_col is None:
+        print("[SKIP] column detection failed")
+        print("Columns:", df.columns.tolist())
+        continue
+
+    df = df[[smiles_col, label_col]].dropna()
+    df.columns = ["smiles", "label"]
+    df["label"] = df["label"].astype(float).astype(int)
+    df = df[df["label"].isin([0, 1])].reset_index(drop=True)
+
+    print("Molecules:", len(df))
+    print("Active molecules:", int(df["label"].sum()))
+    print("SMILES column:", smiles_col)
+    print("Label column:", label_col)
+
+    X = np.vstack([
+        smiles_hash_fp(s)
+        for s in tqdm(df["smiles"], desc=f"Fingerprint {name}")
+    ])
+
+    y = df["label"].values.astype(int)
+    N = len(y)
+
+    active_idx = np.where(y == 1)[0]
+
+    query_idx = np.random.choice(
+        active_idx,
+        size=min(QUERY_COUNT, len(active_idx)),
+        replace=False
+    )
+
+    hit10 = []
+    hit50 = []
+    ndcg10 = []
+    active_counts = []
+    latency = []
+
+    for qi in tqdm(query_idx, desc=f"Run {name}"):
+
+        q = X[qi]
+        scores = tanimoto_scores(q, X)
+        scores[qi] = -1.0
+
+        t0 = time.time()
+        ranked, active_count, stages = thermal_echo(
+            scores,
+            branch=cfg["branch"],
+            echo=cfg["echo"]
+        )
+        latency.append(time.time() - t0)
+
+        hit10.append(hit_at_k(y, ranked, min(10, len(ranked))))
+        hit50.append(hit_at_k(y, ranked, min(50, len(ranked))))
+        ndcg10.append(ndcg_at_k(y, ranked, min(10, len(ranked))))
+        active_counts.append(active_count)
+
+    rows.append({
+        "dataset": name,
+        "molecules": N,
+        "active_molecules": int(y.sum()),
+        "organos_active_candidates_avg": float(np.mean(active_counts)),
+        "compression": float(N / np.mean(active_counts)),
+        "hit@10": float(np.mean(hit10)),
+        "hit@50": float(np.mean(hit50)),
+        "ndcg@10": float(np.mean(ndcg10)),
+        "branch": cfg["branch"],
+        "echo": cfg["echo"],
+        "depth": DEPTH,
+        "latency_sec": float(np.mean(latency)),
+    })
+
+result = pd.DataFrame(rows)
+
+print("\n" + "=" * 100)
+print("FINAL RESULTS")
+print("=" * 100)
+print(result)
+
+result.to_csv(OUT_CSV, index=False)
+
+print("\nSaved:", OUT_CSV)
