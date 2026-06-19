@@ -46,5 +46,31 @@ HIV
 FULL Morgan Fingerprint 검색과 동일한
 Hit@10 = 0.64를 달성했다.
 
+# OrganOS HIV Morgan Benchmark
+
+Reproducible molecular candidate compression benchmark.
+
+Dataset:
+- HIV (41,120 molecules)
+
+Configuration:
+- Morgan Fingerprint Radius=2
+- 2048 bits
+- Branch=4096
+- Echo=16
+- Depth=12
+
+Result:
+
+41,120 molecules
+↓
+17 active candidates
+
+Compression: 2,418.82×
+
+Hit@10: 0.64
+Hit@50: 0.67
+nDCG@10: 0.2386
+
 
 
